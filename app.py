@@ -1,5 +1,18 @@
+# Fix for old SQLite on Streamlit Cloud (does nothing on your Mac)
+try:
+    __import__("pysqlite3")
+    import sys
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except ImportError:
+    pass
+
+import os
+from pathlib import Path
+
 import streamlit as st
 from dotenv import load_dotenv
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
@@ -7,26 +20,43 @@ from langchain_core.prompts import ChatPromptTemplate
 
 load_dotenv()
 
+# On Streamlit Cloud the key comes from Secrets; locally it comes from .env
+try:
+    if "GROQ_API_KEY" in st.secrets:
+        os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
+except Exception:
+    pass
+
+BASE_DIR = Path(__file__).parent
+DB_DIR = str(BASE_DIR / "chroma_db")
+PDF_PATH = BASE_DIR / "document_loader" / "NCERT-Class-10-History.pdf"
+
 st.set_page_config(page_title="NCERT History Chatbot", page_icon="📚")
 st.title("📚 NCERT Class 10 History Chatbot")
 st.caption("Ask questions from the book. Answers come from the document.")
 
 
-# Load the heavy things once, not on every message
-@st.cache_resource
+@st.cache_resource(show_spinner="Loading the book (first start takes a few minutes)...")
 def load_rag():
-    # Must be the same model used in create_database.py
     embeddings_model = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
 
-    vector_store = Chroma(
-        persist_directory="chroma_db",
-        embedding_function=embeddings_model,
-    )
+    if os.path.isdir(DB_DIR) and os.listdir(DB_DIR):
+        vector_store = Chroma(
+            persist_directory=DB_DIR, embedding_function=embeddings_model
+        )
+    else:
+        docs = PyPDFLoader(str(PDF_PATH)).load()
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = splitter.split_documents(docs)
+        vector_store = Chroma.from_documents(
+            documents=chunks,
+            embedding=embeddings_model,
+            persist_directory=DB_DIR,
+        )
 
     retriever = vector_store.as_retriever(search_kwargs={"k": 6})
-
     llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.3)
 
     prompt = ChatPromptTemplate.from_messages([
@@ -38,13 +68,11 @@ Say "I could not find the answer in the document." only if the context has nothi
 Write clear, simple answers suitable for a student."""),
         ("human", "Context:\n{context}\n\nQuestion: {question}"),
     ])
-
     return retriever, prompt | llm
 
 
 retriever, chain = load_rag()
 
-# ---------- Sidebar ----------
 with st.sidebar:
     st.header("About")
     st.write("RAG app: Chroma + HuggingFace embeddings + Groq.")
@@ -53,7 +81,6 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-# ---------- Chat history ----------
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -64,7 +91,6 @@ for msg in st.session_state.messages:
             with st.expander("Sources"):
                 st.write(msg["sources"])
 
-# ---------- New question ----------
 question = st.chat_input("Ask a question about the book...")
 
 if question:
@@ -82,7 +108,6 @@ if question:
             answer = result.content
             st.markdown(answer)
 
-            # PyPDF pages start at 0, so add 1
             pages = sorted({d.metadata.get("page", 0) + 1 for d in docs})
             sources = "Pages: " + ", ".join(map(str, pages))
             with st.expander("Sources"):
