@@ -1,0 +1,10 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+chroma_db/
+.DS_Store.vscode/
+
+.DS_Store
+.vscode/
